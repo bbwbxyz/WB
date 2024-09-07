@@ -1,0 +1,217 @@
+$ErrorActionPreference = "Stop"; [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+
+# 检查当前用户是否属于管理员组
+$isAdmin = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
+if (!$isAdmin)
+{
+	Write-Host "很遗憾! 电脑当前登陆的用户『$($env:USERNAME)』没有管理员权限, 我无法执行! `n若仍想执行, 请按如下步骤操作:`n`n1.先注销当前用户,选择『Administrator』帐户登陆;`n2.然后执行D盘下名为『__将$($env:USERNAME)用户加入管理员组.bat』的文件;`n3.重启系统,选择『$($env:USERNAME)』用户登陆;`n4.再次尝试在运行框中执行我`n`n20秒后自动退出！"
+	$cmdContent = @"
+%1 mshta vbscript:CreateObject("Shell.Application").ShellExecute("cmd.exe","/c %~s0 ::","","runas",1)(window.close)&&exit
+net localgroup Administrators "$env:USERNAME" /add
+echo "$env:USERNAME 用户, 已成功添加到管理员组!"
+"@
+	Set-Content -Path "D:\__将$($env:USERNAME)用户加入管理员组.bat" -Value $cmdContent
+    sleep 20
+    exit
+}
+
+function downloadFiles
+{
+    param (
+        [Parameter(Mandatory = $true)]
+        [array]$files
+    )
+    
+    function DownloadFileFromUrl
+    {
+        param (
+            [string]$url,
+            [string]$outputPath
+        )
+        try
+        {
+            Write-Host "正在从 $url 下载..."
+            (New-Object System.Net.WebClient).DownloadFile($url, $outputPath)
+            return $true
+        }
+        catch
+        {
+            Write-Host "从 $url 下载失败。"
+            return $false
+        }
+    }
+    
+    function VerifyFileHash
+    {
+        param (
+            [string]$filePath,
+            [string]$expectedHash
+        )
+        try
+        {
+            $stream = [System.IO.File]::OpenRead($filePath)
+            $sha256 = [System.Security.Cryptography.SHA256]::Create()
+            $computedHashBytes = $sha256.ComputeHash($stream)
+            $stream.Close()
+            $computedHash = [BitConverter]::ToString($computedHashBytes) -replace '-'
+            return $computedHash -eq $expectedHash
+        }
+        catch
+        {
+            Write-Host "文件哈希验证失败。"
+            return $false
+        }
+    }
+    
+    foreach ($file in $files)
+    {
+        $urls = $file.urls
+        $hash = $file.hash
+        $name = $file.name
+        $targDir = $file.targDir
+        
+        # 设置文件路径
+        $tempFilePath = [System.IO.Path]::Combine($targDir, $name)
+        
+        # 确保目标文件夹存在
+        if (-not (Test-Path $targDir))
+        {
+            New-Item -Path $targDir -ItemType Directory | Out-Null
+        }
+
+        # 检查文件是否存在以及哈希值是否匹配
+        if (Test-Path $tempFilePath)
+        {
+            Write-Host "$name 已经存在。正在验证哈希..."
+            if (VerifyFileHash -filePath $tempFilePath -expectedHash $hash)
+            {
+                Write-Host "文件 $name 已存在且哈希匹配。跳过下载。"
+                continue
+            }
+            else
+            {
+                Write-Host "文件 $name 已存在，但哈希不匹配。正在删除文件..."
+                Remove-Item $tempFilePath
+            }
+        }
+        
+        $downloadSuccess = $false
+        
+        foreach ($url in $urls)
+        {
+            if (DownloadFileFromUrl -url $url -outputPath $tempFilePath)
+            {
+                if (VerifyFileHash -filePath $tempFilePath -expectedHash $hash)
+                {
+                    Write-Host "文件 $name 下载并哈希验证成功。"
+                    $downloadSuccess = $true
+                    break # 跳出循环，停止尝试其他 URL
+                }
+                else
+                {
+                    Write-Host "从 $url 下载的文件哈希验证失败。"
+                }
+            }
+            else
+            {
+                Write-Host "从 $url 下载失败。"
+            }
+        }
+        
+        if (-not $downloadSuccess)
+        {
+            Write-Error "所有下载 $name 的尝试均失败或哈希验证失败。"
+            exit
+        }
+        
+        Write-Host "`n已下载：$($name)`n"
+    }
+}
+
+function Get-seekFolderPath {
+    param (
+        [string]$seekFolder,
+        [long]$maxFreeSpace
+    )
+
+    $folderFound = $false
+    $targetDrive = $null
+    $maxFreeSpaceInBytes = $maxFreeSpace * 1024 * 1024 * 1024 # 将GB转换为字节
+
+    foreach ($drive in [System.IO.DriveInfo]::GetDrives()) {
+        if ($drive.IsReady -and $drive.Name -ne 'C:\') { # 跳过系统分区
+            $folderPath = Join-Path $drive.RootDirectory.FullName $seekFolder
+
+            if (Test-Path $folderPath) {
+                $folderFound = $true
+                return [PSCustomObject]@{
+                    FolderPath = $folderPath
+                    FreeSpace  = [math]::Round($drive.AvailableFreeSpace / 1GB, 2)
+                    Found      = $true
+                }
+            } elseif ($drive.AvailableFreeSpace -gt $maxFreeSpaceInBytes) {
+                if ($null -eq $targetDrive -or $drive.AvailableFreeSpace -gt $targetDrive.AvailableFreeSpace) {
+                    $targetDrive = $drive
+                }
+            }
+        }
+    }
+
+    if (-not $folderFound) {
+        if ($null -ne $targetDrive) {
+            $newFolderPath = Join-Path $targetDrive.RootDirectory.FullName $seekFolder
+            New-Item -Path $newFolderPath -ItemType Directory | Out-Null
+            return [PSCustomObject]@{
+                FolderPath = $newFolderPath
+                FreeSpace  = [math]::Round($targetDrive.AvailableFreeSpace / 1GB, 2)
+                Found      = $true
+            }
+        } else {
+            # 返回最大可用空间的分区
+            $maxFreeSpaceDrive = [System.IO.DriveInfo]::GetDrives() |
+                Where-Object { $_.IsReady -and $_.Name -ne 'C:\' } |
+                Select-Object @{Name='Drive';Expression={$_}}, @{Name='FreeSpace';Expression={$_.AvailableFreeSpace}} |
+                Sort-Object -Property FreeSpace -Descending |
+                Select-Object -First 1
+
+            if ($maxFreeSpaceDrive) {
+                return [PSCustomObject]@{
+                    FolderPath = $maxFreeSpaceDrive.Drive.RootDirectory.FullName # 根目录的路径
+                    FreeSpace  = [math]::Round($maxFreeSpaceDrive.FreeSpace / 1GB, 2)
+                    Found      = $false
+                }
+            }
+        }
+    }
+}
+
+$seekFolder = "__bbwb.xyz__"; $maxFreeSpace = 10 # 单位G
+$r = Get-seekFolderPath -seekFolder $seekFolder -maxFreeSpace $maxFreeSpace
+$r
+if (!$r.Found) {
+    "您硬盘上可用空间最大的分区是 $($r.FolderPath.Trim('\'))`n可用空间约 $($r.FreeSpace) G`n但备份系统所需的空间最少为 $maxFreeSpace G"    
+    return
+}
+
+# 文件下载列表参数
+$targDir = "$($r.FolderPath)\BAK"
+$files = @(
+	@{
+		#http://storage.live.com/items/D05F0DDCCC7EB723!121:/SNA.exe?authkey=%21AKX1RKqlh6nFzlk
+		urls = @(
+			"https://ixaumq.ph.files.1drv.com/y4m7VShykJnR6DIKoKc0nyJJ8mmJRVAO1H9ewitMZTX0sMG4AXcgFKNoQGnyzbvRgtrAko-4acHaDU86Mxkx4i3PE-FPuTzBspYzrd6wQfURCsbyilBIKwaH_nHWmtrOhJBXjsN7pOHI94BB9Ao8EMnoK7IPyooJggFJ5BoMIxuUXWe6VlQFbzfv5G5kgWprNjPu_vxi9S9OBJtW7HEmFanpw/SNA.exe?authkey=%21AKX1RKqlh6nFzlk"
+		)
+		hash = 'DE0D27DD6F6F0AB7A05931076C8F9D1AB51AA424857BD965DA96892C237A45A5'
+		name = "SNA.exe"
+		targDir = $targDir
+	}
+)
+
+# 下载所有文件
+downloadFiles $files
+
+$_ = "$($r.FolderPath)\BAK"; if (!$env:Path.Split(';').Contains($_)) { $env:Path = "$_;$env:Path" }
+$env:Path
+$lb = (Get-Volume $env:SystemDrive[0]).FileSystemLabel
+$lbDir = "$($r.FolderPath)\BAK\WIN\$lb"
+sna $env:SystemDrive "$lbDir\$lb.sna" -R -o"$lbDir\$lb" -L2048 --CreateDir
